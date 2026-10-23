@@ -4,6 +4,7 @@ Orbi BLE Service is an experimental, GPL-2.0-only BLE central backend for the
 built-in controller in the Netgear Orbi RBR50 v1 and RBS50 v1. It is the
 standalone upstream source for the backend proposed in
 [openwrt/packages#30836](https://github.com/openwrt/packages/pull/30836).
+The current source version is `0.1.1`.
 
 The repository builds as a regular Go `main` package. It intentionally does not
 contain the OpenWrt package Makefile, procd init script, rpcd wrapper layout,
@@ -30,9 +31,12 @@ The controller UART must be enabled by the running device tree at
 - GPIO8-11 assigned by the board device tree; and
 - the standard `hci_uart` BCSP transport with `hciextn=Y`.
 
-The service discovers the TTY and HCI relationship through sysfs. It does not
-assume `ttyMSM1` or `hci0`, register a UART at runtime, rebind the UART, alter a
-console, or touch GPIO48.
+The service discovers the TTY and HCI relationship through sysfs. It accepts
+either the older direct `msm_serial` TTY hierarchy or Linux 6.18's exact
+`serial-base` `port` to `ctrl` to platform `msm_serial` ancestry. Every layer
+must retain the same device-tree node and exact subsystem and driver identity.
+It does not assume `ttyMSM1` or `hci0`, register a UART at runtime, rebind the
+UART, alter a console, or touch GPIO48.
 
 Historical prototypes ran on RBR50 v1 and RBS50 v1 with OpenWrt 25.12.5 and
 Linux 6.12.94. Those tests used the prototype's legacy runtime UART module.

@@ -43,7 +43,127 @@ func hasCompatible(raw []byte, expected string) bool {
 	return false
 }
 
+func deviceTreeNode(path string) (string, bool, error) {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	} else if err != nil {
+		return "", false, err
+	}
+	node, err := filepath.EvalSymlinks(path)
+	return node, true, err
+}
+
+func uartPlatformDevice(sysfs, node, port, device string) (string, bool, error) {
+	if !beneath(port, sysfs) || !beneath(device, sysfs) {
+		return "", true, errors.New("Bluetooth TTY device escapes sysfs")
+	}
+	ofNode, exists, err := deviceTreeNode(filepath.Join(device, "of_node"))
+	if !exists {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", true, fmt.Errorf("resolve Bluetooth UART device-tree identity: %w", err)
+	}
+	if ofNode != node {
+		return "", false, nil
+	}
+
+	platformDriver := filepath.Join(sysfs, "bus", "platform", "drivers", "msm_serial")
+	portDriver := filepath.Join(sysfs, "bus", "serial-base", "drivers", "port")
+	ctrlDriver := filepath.Join(sysfs, "bus", "serial-base", "drivers", "ctrl")
+	platformSubsystem := filepath.Join(sysfs, "bus", "platform")
+	serialSubsystem := filepath.Join(sysfs, "bus", "serial-base")
+	platformDevices := filepath.Join(sysfs, "devices", "platform")
+	seen := map[string]bool{}
+	for layer := 0; layer < 3; layer++ {
+		if seen[device] {
+			return "", true, errors.New("Bluetooth UART ancestry contains a loop")
+		}
+		seen[device] = true
+		if layer != 0 {
+			ofNode, exists, err = deviceTreeNode(filepath.Join(device, "of_node"))
+			if !exists {
+				return "", true, errors.New("Bluetooth UART parent lacks a device-tree identity")
+			}
+			if err != nil {
+				return "", true, fmt.Errorf("resolve Bluetooth UART parent device-tree identity: %w", err)
+			}
+			if ofNode != node {
+				return "", true, errors.New("Bluetooth UART ancestry changed device-tree identity before msm_serial")
+			}
+		}
+		driver, err := filepath.EvalSymlinks(filepath.Join(device, "driver"))
+		if err != nil {
+			return "", true, fmt.Errorf("resolve Bluetooth UART driver for %s: %w",
+				filepath.Base(device), err)
+		}
+		subsystem, err := filepath.EvalSymlinks(filepath.Join(device, "subsystem"))
+		if err != nil {
+			return "", true, fmt.Errorf("resolve Bluetooth UART subsystem for %s: %w",
+				filepath.Base(device), err)
+		}
+		switch layer {
+		case 0:
+			if driver == platformDriver {
+				if subsystem != platformSubsystem {
+					return "", true, fmt.Errorf(
+						"Bluetooth UART msm_serial owner has unexpected subsystem %q", subsystem)
+				}
+				if !beneath(device, platformDevices) {
+					return "", true, errors.New("Bluetooth UART msm_serial owner is not a platform device")
+				}
+				if !beneath(port, device) {
+					return "", true, errors.New("Bluetooth TTY does not belong to its platform device")
+				}
+				return device, true, nil
+			}
+			if driver != portDriver {
+				return "", true, fmt.Errorf("Bluetooth UART has unexpected first-level driver %q", driver)
+			}
+			if subsystem != serialSubsystem {
+				return "", true, fmt.Errorf(
+					"Bluetooth UART port has unexpected subsystem %q", subsystem)
+			}
+		case 1:
+			if driver != ctrlDriver {
+				return "", true, fmt.Errorf(
+					"Bluetooth UART serial-base port is not parented by the ctrl driver: %q", driver)
+			}
+			if subsystem != serialSubsystem {
+				return "", true, fmt.Errorf(
+					"Bluetooth UART ctrl has unexpected subsystem %q", subsystem)
+			}
+		case 2:
+			if driver != platformDriver {
+				return "", true, fmt.Errorf(
+					"Bluetooth UART serial-base ctrl is not parented by msm_serial: %q", driver)
+			}
+			if subsystem != platformSubsystem {
+				return "", true, fmt.Errorf(
+					"Bluetooth UART msm_serial owner has unexpected subsystem %q", subsystem)
+			}
+			if !beneath(device, platformDevices) {
+				return "", true, errors.New("Bluetooth UART msm_serial owner is not a platform device")
+			}
+			if !beneath(port, device) {
+				return "", true, errors.New("Bluetooth TTY does not belong to its platform device")
+			}
+			return device, true, nil
+		}
+		parent := filepath.Dir(device)
+		if parent == device || !beneath(parent, sysfs) {
+			return "", true, errors.New("Bluetooth UART ancestry left sysfs before reaching msm_serial")
+		}
+		device = parent
+	}
+	return "", true, errors.New("Bluetooth UART ancestry did not reach msm_serial")
+}
+
 func discoverUART(sysfs string) (*uart, error) {
+	sysfs, err := filepath.EvalSymlinks(sysfs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve sysfs root: %w", err)
+	}
 	tree := filepath.Join(sysfs, "firmware", "devicetree", "base")
 	board, err := os.ReadFile(filepath.Join(tree, "compatible"))
 	if err != nil {
@@ -86,36 +206,23 @@ func discoverUART(sysfs string) (*uart, error) {
 		}
 		device, err := filepath.EvalSymlinks(filepath.Join(entry, "device"))
 		if err != nil {
+			return nil, fmt.Errorf("resolve Bluetooth TTY device: %w", err)
+		}
+		platform, matches, err := uartPlatformDevice(sysfs, node, port, device)
+		if err != nil {
 			return nil, err
 		}
-		for parent := device; beneath(parent, sysfs); parent = filepath.Dir(parent) {
-			ofNode, err := filepath.EvalSymlinks(filepath.Join(parent, "of_node"))
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			if err != nil {
-				return nil, err
-			}
-			if ofNode != node {
-				break
-			}
-			driver, err := filepath.EvalSymlinks(filepath.Join(parent, "driver"))
-			if err != nil || filepath.Base(driver) != "msm_serial" {
-				return nil, errors.New("Bluetooth UART is not bound to msm_serial")
-			}
-			if !beneath(port, parent) {
-				return nil, errors.New("Bluetooth TTY does not belong to its platform device")
-			}
-			if selected != nil {
-				return nil, errors.New("Bluetooth UART has multiple TTY candidates")
-			}
-			info, err := os.Stat(port)
-			if err != nil {
-				return nil, err
-			}
-			selected = &uart{name: name, path: port, device: parent, info: info}
-			break
+		if !matches {
+			continue
 		}
+		if selected != nil {
+			return nil, errors.New("Bluetooth UART has multiple TTY candidates")
+		}
+		info, err := os.Stat(port)
+		if err != nil {
+			return nil, err
+		}
+		selected = &uart{name: name, path: port, device: platform, info: info}
 	}
 	if selected == nil {
 		return nil, errors.New("enabled Bluetooth UART has no unique ttyMSM device")

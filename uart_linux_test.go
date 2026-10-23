@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -43,15 +44,32 @@ func uartFixture(t *testing.T, board string, nested bool) (string, *uart) {
 	binary.BigEndian.PutUint32(reg[4:], 0x200)
 	fixtureFile(t, filepath.Join(node, "reg"), reg)
 	platform := filepath.Join(sysfs, "devices", "platform", "soc", "78b0000.serial")
-	driver := filepath.Join(sysfs, "bus", "platform", "drivers", "msm_serial")
-	if err := os.MkdirAll(driver, 0700); err != nil {
+	platformDriver := filepath.Join(sysfs, "bus", "platform", "drivers", "msm_serial")
+	if err := os.MkdirAll(platformDriver, 0700); err != nil {
 		t.Fatal(err)
 	}
 	fixtureLink(t, node, filepath.Join(platform, "of_node"))
-	fixtureLink(t, driver, filepath.Join(platform, "driver"))
+	fixtureLink(t, platformDriver, filepath.Join(platform, "driver"))
+	fixtureLink(t, filepath.Join(sysfs, "bus", "platform"), filepath.Join(platform, "subsystem"))
 	parent := platform
 	if nested {
-		parent = filepath.Join(platform, "78b0000.serial:0", "78b0000.serial:0.0")
+		ctrl := filepath.Join(platform, "78b0000.serial:0")
+		port := filepath.Join(ctrl, "78b0000.serial:0.0")
+		ctrlDriver := filepath.Join(sysfs, "bus", "serial-base", "drivers", "ctrl")
+		portDriver := filepath.Join(sysfs, "bus", "serial-base", "drivers", "port")
+		if err := os.MkdirAll(ctrlDriver, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(portDriver, 0700); err != nil {
+			t.Fatal(err)
+		}
+		fixtureLink(t, node, filepath.Join(ctrl, "of_node"))
+		fixtureLink(t, ctrlDriver, filepath.Join(ctrl, "driver"))
+		fixtureLink(t, filepath.Join(sysfs, "bus", "serial-base"), filepath.Join(ctrl, "subsystem"))
+		fixtureLink(t, node, filepath.Join(port, "of_node"))
+		fixtureLink(t, portDriver, filepath.Join(port, "driver"))
+		fixtureLink(t, filepath.Join(sysfs, "bus", "serial-base"), filepath.Join(port, "subsystem"))
+		parent = port
 	}
 	port := filepath.Join(parent, "tty", "ttyMSM7")
 	fixtureLink(t, parent, filepath.Join(port, "device"))
@@ -72,24 +90,296 @@ func fixtureHCI(t *testing.T, sysfs string, u *uart, name string) {
 	fixtureLink(t, path, filepath.Join(sysfs, "class", "bluetooth", name))
 }
 
-func TestUARTDiscoveryHandlesSerialBaseAndNonFixedTTY(t *testing.T) {
+func TestUARTDiscoveryHandlesFlatAndSerialBaseHierarchy(t *testing.T) {
 	for _, board := range []string{"netgear,rbr50", "netgear,rbs50"} {
 		t.Run(board, func(t *testing.T) {
 			for _, nested := range []bool{false, true} {
-				sysfs, u := uartFixture(t, board, nested)
-				if u.name != "ttyMSM7" {
-					t.Fatalf("fixed TTY assumption: %+v", u)
+				name := "flat"
+				if nested {
+					name = "serial-base"
 				}
-				if err := u.verify(sysfs); err != nil {
-					t.Fatal(err)
-				}
-				fixtureHCI(t, sysfs, u, "hci4")
-				hci, _, err := hciForUART(sysfs, u)
-				if err != nil || hci != "hci4" {
-					t.Fatalf("owned HCI=%q err=%v", hci, err)
-				}
+				t.Run(name, func(t *testing.T) {
+					sysfs, u := uartFixture(t, board, nested)
+					if u.name != "ttyMSM7" || filepath.Base(u.device) != "78b0000.serial" {
+						t.Fatalf("wrong TTY or platform identity: %+v", u)
+					}
+					if err := u.verify(sysfs); err != nil {
+						t.Fatal(err)
+					}
+					fixtureHCI(t, sysfs, u, "hci4")
+					hci, _, err := hciForUART(sysfs, u)
+					if err != nil || hci != "hci4" {
+						t.Fatalf("owned HCI=%q err=%v", hci, err)
+					}
+				})
 			}
 		})
+	}
+}
+
+func replaceFixtureLink(t *testing.T, target, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	fixtureLink(t, target, path)
+}
+
+func TestUARTDiscoveryValidatesSerialBaseHierarchy(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, string, *uart)
+		want   string
+	}{
+		{
+			name: "wrong-port-driver-path",
+			mutate: func(t *testing.T, sysfs string, u *uart) {
+				port, err := filepath.EvalSymlinks(filepath.Join(u.path, "device"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				wrong := filepath.Join(sysfs, "bus", "wrong", "drivers", "port")
+				if err := os.MkdirAll(wrong, 0700); err != nil {
+					t.Fatal(err)
+				}
+				replaceFixtureLink(t, wrong, filepath.Join(port, "driver"))
+			},
+			want: "unexpected first-level driver",
+		},
+		{
+			name: "wrong-port-subsystem",
+			mutate: func(t *testing.T, sysfs string, u *uart) {
+				port, err := filepath.EvalSymlinks(filepath.Join(u.path, "device"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				replaceFixtureLink(t, filepath.Join(sysfs, "bus", "platform"),
+					filepath.Join(port, "subsystem"))
+			},
+			want: "port has unexpected subsystem",
+		},
+		{
+			name: "wrong-ctrl-driver",
+			mutate: func(t *testing.T, sysfs string, u *uart) {
+				port, err := filepath.EvalSymlinks(filepath.Join(u.path, "device"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctrl := filepath.Dir(port)
+				replaceFixtureLink(t, filepath.Join(sysfs, "bus", "serial-base", "drivers", "port"),
+					filepath.Join(ctrl, "driver"))
+			},
+			want: "port is not parented by the ctrl driver",
+		},
+		{
+			name: "wrong-ctrl-subsystem",
+			mutate: func(t *testing.T, sysfs string, u *uart) {
+				port, err := filepath.EvalSymlinks(filepath.Join(u.path, "device"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				replaceFixtureLink(t, filepath.Join(sysfs, "bus", "platform"),
+					filepath.Join(filepath.Dir(port), "subsystem"))
+			},
+			want: "ctrl has unexpected subsystem",
+		},
+		{
+			name: "missing-port-driver",
+			mutate: func(t *testing.T, _ string, u *uart) {
+				port, err := filepath.EvalSymlinks(filepath.Join(u.path, "device"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(filepath.Join(port, "driver")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "resolve Bluetooth UART driver",
+		},
+		{
+			name: "missing-msm-serial-driver",
+			mutate: func(t *testing.T, _ string, u *uart) {
+				if err := os.Remove(filepath.Join(u.device, "driver")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "resolve Bluetooth UART driver",
+		},
+		{
+			name: "wrong-msm-serial-driver-path",
+			mutate: func(t *testing.T, sysfs string, u *uart) {
+				wrong := filepath.Join(sysfs, "bus", "wrong", "drivers", "msm_serial")
+				if err := os.MkdirAll(wrong, 0700); err != nil {
+					t.Fatal(err)
+				}
+				replaceFixtureLink(t, wrong, filepath.Join(u.device, "driver"))
+			},
+			want: "ctrl is not parented by msm_serial",
+		},
+		{
+			name: "wrong-platform-subsystem",
+			mutate: func(t *testing.T, sysfs string, u *uart) {
+				replaceFixtureLink(t, filepath.Join(sysfs, "bus", "serial-base"),
+					filepath.Join(u.device, "subsystem"))
+			},
+			want: "msm_serial owner has unexpected subsystem",
+		},
+		{
+			name: "different-parent-of-node",
+			mutate: func(t *testing.T, sysfs string, u *uart) {
+				port, err := filepath.EvalSymlinks(filepath.Join(u.path, "device"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				other := filepath.Join(sysfs, "firmware", "devicetree", "base", "soc", "serial@other")
+				if err := os.MkdirAll(other, 0700); err != nil {
+					t.Fatal(err)
+				}
+				replaceFixtureLink(t, other, filepath.Join(filepath.Dir(port), "of_node"))
+			},
+			want: "changed device-tree identity",
+		},
+		{
+			name: "driver-symlink-loop",
+			mutate: func(t *testing.T, _ string, u *uart) {
+				port, err := filepath.EvalSymlinks(filepath.Join(u.path, "device"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				driver := filepath.Join(port, "driver")
+				if err := os.Remove(driver); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(driver, driver); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "resolve Bluetooth UART driver",
+		},
+		{
+			name: "of-node-symlink-loop",
+			mutate: func(t *testing.T, _ string, u *uart) {
+				port, err := filepath.EvalSymlinks(filepath.Join(u.path, "device"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				ofNode := filepath.Join(port, "of_node")
+				if err := os.Remove(ofNode); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(ofNode, ofNode); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "resolve Bluetooth UART device-tree identity",
+		},
+		{
+			name: "device-symlink-loop",
+			mutate: func(t *testing.T, _ string, u *uart) {
+				device := filepath.Join(u.path, "device")
+				if err := os.Remove(device); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(device, device); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "resolve Bluetooth TTY device",
+		},
+		{
+			name: "device-outside-sysfs",
+			mutate: func(t *testing.T, _ string, u *uart) {
+				outside := filepath.Join(t.TempDir(), "outside")
+				if err := os.MkdirAll(outside, 0700); err != nil {
+					t.Fatal(err)
+				}
+				replaceFixtureLink(t, outside, filepath.Join(u.path, "device"))
+			},
+			want: "escapes sysfs",
+		},
+		{
+			name: "msm-serial-owner-not-platform-device",
+			mutate: func(t *testing.T, sysfs string, u *uart) {
+				tree := filepath.Join(sysfs, "firmware", "devicetree", "base")
+				node := filepath.Join(tree, "soc", "serial@78b0000")
+				platform := filepath.Join(sysfs, "devices", "virtual", "orphan.serial")
+				ctrl := filepath.Join(platform, "orphan.serial:0")
+				port := filepath.Join(ctrl, "orphan.serial:0.0")
+				fixtureLink(t, node, filepath.Join(platform, "of_node"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "platform", "drivers", "msm_serial"),
+					filepath.Join(platform, "driver"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "platform"),
+					filepath.Join(platform, "subsystem"))
+				fixtureLink(t, node, filepath.Join(ctrl, "of_node"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "serial-base", "drivers", "ctrl"),
+					filepath.Join(ctrl, "driver"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "serial-base"),
+					filepath.Join(ctrl, "subsystem"))
+				fixtureLink(t, node, filepath.Join(port, "of_node"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "serial-base", "drivers", "port"),
+					filepath.Join(port, "driver"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "serial-base"),
+					filepath.Join(port, "subsystem"))
+				replaceFixtureLink(t, port, filepath.Join(u.path, "device"))
+			},
+			want: "msm_serial owner is not a platform device",
+		},
+		{
+			name: "tty-outside-platform-ancestor",
+			mutate: func(t *testing.T, sysfs string, u *uart) {
+				tree := filepath.Join(sysfs, "firmware", "devicetree", "base")
+				node := filepath.Join(tree, "soc", "serial@78b0000")
+				platform := filepath.Join(sysfs, "devices", "platform", "soc", "other.serial")
+				ctrl := filepath.Join(platform, "other.serial:0")
+				port := filepath.Join(ctrl, "other.serial:0.0")
+				fixtureLink(t, node, filepath.Join(platform, "of_node"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "platform", "drivers", "msm_serial"),
+					filepath.Join(platform, "driver"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "platform"),
+					filepath.Join(platform, "subsystem"))
+				fixtureLink(t, node, filepath.Join(ctrl, "of_node"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "serial-base", "drivers", "ctrl"),
+					filepath.Join(ctrl, "driver"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "serial-base"),
+					filepath.Join(ctrl, "subsystem"))
+				fixtureLink(t, node, filepath.Join(port, "of_node"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "serial-base", "drivers", "port"),
+					filepath.Join(port, "driver"))
+				fixtureLink(t, filepath.Join(sysfs, "bus", "serial-base"),
+					filepath.Join(port, "subsystem"))
+				replaceFixtureLink(t, port, filepath.Join(u.path, "device"))
+			},
+			want: "does not belong to its platform device",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sysfs, u := uartFixture(t, "netgear,rbs50", true)
+			tc.mutate(t, sysfs, u)
+			if _, err := discoverUART(sysfs); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestUARTDiscoveryIgnoresUnrelatedTTY(t *testing.T) {
+	sysfs, expected := uartFixture(t, "netgear,rbs50", true)
+	tree := filepath.Join(sysfs, "firmware", "devicetree", "base")
+	otherNode := filepath.Join(tree, "soc", "serial@other")
+	otherDevice := filepath.Join(sysfs, "devices", "platform", "soc", "other.serial")
+	otherTTY := filepath.Join(otherDevice, "tty", "ttyMSM8")
+	if err := os.MkdirAll(otherNode, 0700); err != nil {
+		t.Fatal(err)
+	}
+	fixtureLink(t, otherNode, filepath.Join(otherDevice, "of_node"))
+	fixtureLink(t, otherDevice, filepath.Join(otherTTY, "device"))
+	fixtureLink(t, otherTTY, filepath.Join(sysfs, "class", "tty", "ttyMSM8"))
+	got, err := discoverUART(sysfs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.name != expected.name || got.path != expected.path || got.device != expected.device {
+		t.Fatalf("unrelated TTY changed selection: got=%+v want=%+v", got, expected)
 	}
 }
 
