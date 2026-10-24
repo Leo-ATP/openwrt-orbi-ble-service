@@ -3,11 +3,13 @@
 package main
 
 import (
-	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -72,6 +74,7 @@ func uartFixture(t *testing.T, board string, nested bool) (string, *uart) {
 		parent = port
 	}
 	port := filepath.Join(parent, "tty", "ttyMSM7")
+	fixtureFile(t, filepath.Join(port, "dev"), []byte("4:64\n"))
 	fixtureLink(t, parent, filepath.Join(port, "device"))
 	fixtureLink(t, port, filepath.Join(sysfs, "class", "tty", "ttyMSM7"))
 	u, err := discoverUART(sysfs)
@@ -429,102 +432,111 @@ func TestUARTDiscoveryRejectsOtherBoards(t *testing.T) {
 	}
 }
 
-func TestForeignHCIAndChangedIdentityAreNeverDetached(t *testing.T) {
-	for _, changed := range []bool{false, true} {
-		sysfs, u := uartFixture(t, "netgear,rbr50", true)
-		fixtureHCI(t, sysfs, u, "hci4")
-		hci, info, err := hciForUART(sysfs, u)
-		if err != nil {
-			t.Fatal(err)
-		}
-		transport := &uartTransport{
-			uart: u, sysfs: sysfs, hci: hci, hciInfo: info,
-			child: &child{done: make(chan struct{})},
-		}
-		if changed {
-			path := filepath.Join(u.path, "bluetooth", "hci4")
-			if err := os.Rename(path, path+".old"); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Mkdir(path, 0700); err != nil {
-				t.Fatal(err)
-			}
-		} else {
-			foreign := filepath.Join(sysfs, "devices", "usb", "bluetooth", "hci8")
-			if err := os.MkdirAll(foreign, 0700); err != nil {
-				t.Fatal(err)
-			}
-			fixtureLink(t, foreign, filepath.Join(sysfs, "class", "bluetooth", "hci8"))
-		}
-		if err := transport.verify(); err == nil {
-			t.Fatal("foreign or replaced controller accepted")
-		}
-		// A signal would panic on this process-free fixture if the guard failed.
-		if err := transport.detach(context.Background()); err == nil {
-			t.Fatal("foreign or replaced controller detached")
-		}
-	}
-}
-
-func TestExistingHCIBlocksAttachBeforeAnyCommand(t *testing.T) {
+func TestAvailableUARTRejectsExistingHCI(t *testing.T) {
 	sysfs, u := uartFixture(t, "netgear,rbr50", true)
 	fixtureHCI(t, sysfs, u, "hci4")
-	transport := &uartTransport{uart: u, sysfs: sysfs, proc: t.TempDir(), dev: t.TempDir()}
-	if err := transport.attach(context.Background()); err == nil || transport.child != nil {
-		t.Fatal("attach attempted to replace an existing HCI")
+	if _, err := availableUART(sysfs, t.TempDir(), t.TempDir()); err == nil {
+		t.Fatal("existing HCI was accepted")
 	}
 }
 
-func TestTransportStatusCanOverlapCompletedDetach(t *testing.T) {
+func TestAttachedUARTIgnoresUnrelatedHCI(t *testing.T) {
 	sysfs, u := uartFixture(t, "netgear,rbr50", true)
-	done := make(chan struct{})
-	close(done)
-	transport := &uartTransport{
-		uart: u, sysfs: sysfs, hci: "hci4", child: &child{done: done},
-	}
-	readerStarted, readerDone := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		close(readerStarted)
-		for i := 0; i < 100; i++ {
-			transport.controller()
-			transport.exited()
-			_ = transport.verify()
-		}
-	}()
-	<-readerStarted
-	if err := transport.detach(context.Background()); err != nil {
+	fixtureHCI(t, sysfs, u, "hci4")
+	foreign := filepath.Join(sysfs, "devices", "usb", "bluetooth", "hci8")
+	if err := os.MkdirAll(foreign, 0700); err != nil {
 		t.Fatal(err)
 	}
-	<-readerDone
-	if transport.controller() != "" || transport.exited() != nil {
-		t.Fatal("completed attachment owner was retained")
+	fixtureLink(t, foreign, filepath.Join(sysfs, "class", "bluetooth", "hci8"))
+	_, hci, _, err := attachedUART(sysfs)
+	if err != nil || hci != "hci4" {
+		t.Fatalf("target HCI=%q err=%v", hci, err)
+	}
+}
+
+func TestAttachedUARTRejectsMultipleTargetHCI(t *testing.T) {
+	sysfs, u := uartFixture(t, "netgear,rbr50", true)
+	fixtureHCI(t, sysfs, u, "hci4")
+	fixtureHCI(t, sysfs, u, "hci5")
+	if _, _, _, err := attachedUART(sysfs); err == nil {
+		t.Fatal("multiple target HCI controllers were accepted")
+	}
+}
+
+func TestAvailableUARTChecksCharacterDeviceAndConsole(t *testing.T) {
+	sysfs, u := uartFixture(t, "netgear,rbs50", true)
+	foreign := filepath.Join(sysfs, "devices", "usb", "bluetooth", "hci8")
+	if err := os.MkdirAll(foreign, 0700); err != nil {
+		t.Fatal(err)
+	}
+	fixtureLink(t, foreign, filepath.Join(sysfs, "class", "bluetooth", "hci8"))
+	dev, proc := t.TempDir(), t.TempDir()
+	info, err := os.Stat("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	major, minor, device, err := characterDeviceInfo(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureFile(t, filepath.Join(u.path, "dev"),
+		[]byte(fmt.Sprintf("%d:%d\n", major, minor)))
+	node := filepath.Join(dev, u.name)
+	if err := syscall.Mknod(node, syscall.S_IFCHR|0600, int(device)); err != nil {
+		if errors.Is(err, syscall.EPERM) {
+			t.Skip("creating a character-device fixture requires permission")
+		}
+		t.Fatal(err)
+	}
+	fixtureFile(t, filepath.Join(proc, "consoles"), nil)
+	got, err := availableUART(sysfs, dev, proc)
+	if err != nil || got.name != u.name {
+		t.Fatalf("available UART=%+v err=%v", got, err)
+	}
+	fixtureFile(t, filepath.Join(proc, "consoles"), []byte(u.name+" -W- (EC p a) 4:64\n"))
+	if _, err := availableUART(sysfs, dev, proc); err == nil {
+		t.Fatal("console UART was accepted")
+	}
+}
+
+func TestLinuxDeviceNumberDecoding(t *testing.T) {
+	info, err := os.Stat("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	major, minor, _, err := characterDeviceInfo(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if major != 1 || minor != 3 {
+		t.Fatalf("/dev/null decoded as %d:%d", major, minor)
+	}
+}
+
+func TestAvailableUARTRejectsDeviceSymlink(t *testing.T) {
+	sysfs, u := uartFixture(t, "netgear,rbs50", true)
+	dev, proc := t.TempDir(), t.TempDir()
+	if err := os.Symlink("/dev/null", filepath.Join(dev, u.name)); err != nil {
+		t.Fatal(err)
+	}
+	fixtureFile(t, filepath.Join(proc, "consoles"), nil)
+	if _, err := availableUART(sysfs, dev, proc); err == nil {
+		t.Fatal("symlink character device was accepted")
 	}
 }
 
 func TestRefuseTTYAlreadyOpenedByAnotherProcess(t *testing.T) {
 	proc := t.TempDir()
-	device := filepath.Join(t.TempDir(), "ttyMSM7")
-	fixtureFile(t, device, nil)
-	fixtureLink(t, device, filepath.Join(proc, "123", "fd", "4"))
+	info, err := os.Stat("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, device, err := characterDeviceInfo(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureLink(t, "/dev/null", filepath.Join(proc, "123", "fd", "4"))
 	if err := refuseTTYUsers(proc, device); err == nil {
 		t.Fatal("open TTY was accepted")
-	}
-}
-
-func TestStorageSymlinkIsNotFollowed(t *testing.T) {
-	old := bluezStorageDir
-	root := t.TempDir()
-	target := filepath.Join(root, "other-owner")
-	fixtureFile(t, filepath.Join(target, bluezStorageMarker), []byte(bluezStorageIdentity))
-	bluezStorageDir = filepath.Join(root, "bluetooth")
-	fixtureLink(t, target, bluezStorageDir)
-	t.Cleanup(func() { bluezStorageDir = old })
-	r := &runtime{}
-	if err := r.prepareStorage(); err == nil {
-		t.Fatal("storage symlink was accepted")
-	}
-	if _, err := os.Stat(target); err != nil {
-		t.Fatal("symlink target was changed")
 	}
 }

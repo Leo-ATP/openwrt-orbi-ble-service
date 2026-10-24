@@ -3,16 +3,14 @@
 package main
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
 var (
@@ -269,7 +267,7 @@ func hciForUART(sysfs string, u *uart) (string, os.FileInfo, error) {
 			return "", nil, err
 		}
 		if !beneath(path, u.path) {
-			return "", nil, errors.New("another Bluetooth controller is present")
+			continue
 		}
 		if found != "" {
 			return "", nil, errors.New("multiple HCI controllers belong to the UART")
@@ -283,111 +281,7 @@ func hciForUART(sysfs string, u *uart) (string, os.FileInfo, error) {
 	return found, info, nil
 }
 
-type controllerTransport interface {
-	attach(context.Context) error
-	detach(context.Context) error
-	verify() error
-	controller() string
-	tty() string
-	exited() <-chan struct{}
-}
-
-type uartTransport struct {
-	mu      sync.RWMutex
-	uart    *uart
-	sysfs   string
-	dev     string
-	proc    string
-	child   *child
-	hci     string
-	hciInfo os.FileInfo
-}
-
-func (t *uartTransport) controller() string {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.hci
-}
-
-func (t *uartTransport) tty() string { return t.uart.name }
-
-func (t *uartTransport) exited() <-chan struct{} {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if t.child == nil {
-		return nil
-	}
-	return t.child.done
-}
-
-func (t *uartTransport) attach(ctx context.Context) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.child != nil {
-		return errors.New("an HCI attachment is already owned")
-	}
-	if err := t.uart.verify(t.sysfs); err != nil {
-		return err
-	}
-	entries, err := hciEntries(t.sysfs)
-	if err != nil {
-		return err
-	}
-	if len(entries) != 0 {
-		return errors.New("another Bluetooth controller is present; refusing attachment")
-	}
-	consoles, err := os.ReadFile(filepath.Join(t.proc, "consoles"))
-	if err != nil {
-		return err
-	}
-	for _, line := range strings.Split(string(consoles), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 0 && fields[0] == t.uart.name {
-			return errors.New("Bluetooth UART is a console; refusing attachment")
-		}
-	}
-	device := filepath.Join(t.dev, t.uart.name)
-	info, err := os.Stat(device)
-	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
-		return errors.New("Bluetooth UART character device is unavailable")
-	}
-	if err := refuseTTYUsers(t.proc, device); err != nil {
-		return err
-	}
-	if _, err := os.Stat(filepath.Join(t.sysfs, "module", "hci_uart")); errors.Is(err, os.ErrNotExist) {
-		if _, err := command(ctx, "/sbin/modprobe", "hci_uart"); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	}
-	// Keep the foreground process as our child, rather than trusting a PID file.
-	t.child, err = startChild("/usr/bin/hciattach", "-n", "-t", "10", "-s", "115200",
-		device, "bcsp", "115200", "noflow")
-	if err != nil {
-		return err
-	}
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		t.hci, t.hciInfo, err = hciForUART(t.sysfs, t.uart)
-		if err != nil {
-			return err
-		}
-		if t.hci != "" {
-			return t.verifyLocked()
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.child.done:
-			return fmt.Errorf("hciattach exited during attachment: %v", t.child.err)
-		case <-ticker.C:
-		}
-	}
-}
-
-func refuseTTYUsers(proc, device string) error {
+func refuseTTYUsers(proc string, device uint64) error {
 	entries, err := os.ReadDir(proc)
 	if err != nil {
 		return err
@@ -404,14 +298,21 @@ func refuseTTYUsers(proc, device string) error {
 			return err
 		}
 		for _, fd := range fds {
-			target, err := os.Readlink(filepath.Join(proc, entry.Name(), "fd", fd.Name()))
+			info, err := os.Stat(filepath.Join(proc, entry.Name(), "fd", fd.Name()))
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
 			if err != nil {
 				return err
 			}
-			if target == device {
+			if info.Mode()&os.ModeCharDevice == 0 {
+				continue
+			}
+			_, _, current, err := characterDeviceInfo(info)
+			if err != nil {
+				return err
+			}
+			if current == device {
 				return errors.New("Bluetooth UART is already open by another process")
 			}
 		}
@@ -419,64 +320,89 @@ func refuseTTYUsers(proc, device string) error {
 	return nil
 }
 
-func (t *uartTransport) verify() error {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.verifyLocked()
+func numericPID(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, character := range name {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
-func (t *uartTransport) verifyLocked() error {
-	if t.child == nil || !t.child.running() || t.hci == "" || t.hciInfo == nil {
-		return errors.New("owned hciattach is not running")
-	}
-	if err := t.uart.verify(t.sysfs); err != nil {
-		return err
-	}
-	hci, info, err := hciForUART(t.sysfs, t.uart)
+func ttyDeviceNumbers(path string) (uint64, uint64, error) {
+	raw, err := os.ReadFile(filepath.Join(path, "dev"))
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
-	if hci != t.hci || info == nil || !os.SameFile(info, t.hciInfo) {
-		return errors.New("HCI controller ownership changed")
+	fields := strings.Split(strings.TrimSpace(string(raw)), ":")
+	if len(fields) != 2 {
+		return 0, 0, errors.New("Bluetooth TTY has an invalid device number")
 	}
-	return nil
+	major, err := strconv.ParseUint(fields[0], 10, 64)
+	if err != nil {
+		return 0, 0, errors.New("Bluetooth TTY has an invalid major number")
+	}
+	minor, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return 0, 0, errors.New("Bluetooth TTY has an invalid minor number")
+	}
+	return major, minor, nil
 }
 
-func (t *uartTransport) detach(ctx context.Context) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.child == nil {
-		return nil
-	}
-	if err := t.uart.verify(t.sysfs); err != nil {
-		return err
-	}
-	hci, info, err := hciForUART(t.sysfs, t.uart)
+func availableUART(sysfs, dev, proc string) (*uart, error) {
+	u, err := discoverUART(sysfs)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if hci != "" && t.hci != "" &&
-		(hci != t.hci || info == nil || !os.SameFile(info, t.hciInfo)) {
-		return errors.New("HCI ownership changed; refusing to detach another owner")
+	hci, _, err := hciForUART(sysfs, u)
+	if err != nil {
+		return nil, err
 	}
-	if err := t.child.stop(); err != nil {
-		return err
+	if hci != "" {
+		return nil, errors.New("the Bluetooth UART already has an attached controller")
 	}
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		hci, _, err := hciForUART(t.sysfs, t.uart)
-		if err != nil {
-			return err
-		}
-		if hci == "" {
-			t.child, t.hci, t.hciInfo = nil, "", nil
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("owned HCI did not disappear: %w", ctx.Err())
-		case <-ticker.C:
+	consoles, err := os.ReadFile(filepath.Join(proc, "consoles"))
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(string(consoles), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 0 && fields[0] == u.name {
+			return nil, errors.New("Bluetooth UART is a console")
 		}
 	}
+	device := filepath.Join(dev, u.name)
+	major, minor, deviceID, err := characterDeviceIdentity(device)
+	if err != nil {
+		return nil, fmt.Errorf("verify Bluetooth UART character device: %w", err)
+	}
+	expectedMajor, expectedMinor, err := ttyDeviceNumbers(u.path)
+	if err != nil {
+		return nil, err
+	}
+	if major != expectedMajor || minor != expectedMinor {
+		return nil, errors.New("Bluetooth UART character device does not match sysfs")
+	}
+	if err := refuseTTYUsers(proc, deviceID); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+func attachedUART(sysfs string) (*uart, string, os.FileInfo, error) {
+	u, err := discoverUART(sysfs)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	hci, info, err := hciForUART(sysfs, u)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	if hci == "" || info == nil {
+		return nil, "", nil, errors.New("the verified UART has no attached HCI controller")
+	}
+	return u, hci, info, nil
 }

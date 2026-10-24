@@ -3,13 +3,11 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -23,21 +21,20 @@ const (
 )
 
 var (
-	csrCommandTimeout  = 5 * time.Second
-	anaFreqPendingPath = runDir + "/ana-freq.pending"
-	hciExtensionPath   = "/sys/module/hci_uart/parameters/hciextn"
+	csrCommandTimeout = 5 * time.Second
 )
 
-type csrCommandRunner func(context.Context, string, ...string) (string, error)
-
-type hciTrace struct {
-	commands     [][]byte
-	vendorEvents [][]byte
+type csrCommandResult struct {
+	Dispatched  bool
+	VendorEvent []byte
 }
 
-func enableRBRHCI(parent context.Context, hci string, run csrCommandRunner) error {
+type csrCommandRunner func(context.Context, string, []byte) (csrCommandResult, error)
+type commandRunner func(context.Context, string, ...string) (string, error)
+
+func enableRBRHCI(parent context.Context, hci string, run commandRunner) error {
 	if !hciPattern.MatchString(hci) || run == nil {
-		return errors.New("owned HCI command runner is unavailable")
+		return errors.New("verified HCI command runner is unavailable")
 	}
 	ctx, cancel := context.WithTimeout(parent, csrCommandTimeout)
 	defer cancel()
@@ -47,21 +44,21 @@ func enableRBRHCI(parent context.Context, hci string, run csrCommandRunner) erro
 	return nil
 }
 
-func disableRBRHCI(parent context.Context, hci string, run csrCommandRunner) error {
+func disableRBRHCI(parent context.Context, hci string, run commandRunner) error {
 	if !hciPattern.MatchString(hci) || run == nil {
-		return errors.New("owned HCI command runner is unavailable")
+		return errors.New("verified HCI command runner is unavailable")
 	}
 	ctx, cancel := context.WithTimeout(parent, csrCommandTimeout)
 	defer cancel()
 	if _, err := run(ctx, "hciconfig", hci, "down"); err != nil {
-		return fmt.Errorf("bring %s down before BlueZ startup: %w", hci, err)
+		return fmt.Errorf("bring %s down before stack handoff: %w", hci, err)
 	}
 	output, err := run(ctx, "hciconfig", hci)
 	if err != nil {
 		return fmt.Errorf("confirm %s is down: %w", hci, err)
 	}
 	if !strings.Contains(output, "DOWN") {
-		return fmt.Errorf("%s did not report DOWN before BlueZ startup", hci)
+		return fmt.Errorf("%s did not report DOWN before stack handoff", hci)
 	}
 	return nil
 }
@@ -75,97 +72,24 @@ func csrPDU(words ...uint16) []byte {
 	return pdu
 }
 
-func csrCommandArgs(hci string, pdu []byte) ([]string, error) {
-	if !hciPattern.MatchString(hci) {
-		return nil, errors.New("invalid HCI controller identity")
-	}
-	args := []string{"-i", hci, "cmd", "0x3f", "0x0000"}
-	for _, value := range pdu {
-		args = append(args, fmt.Sprintf("0x%02x", value))
-	}
-	return args, nil
-}
-
-func parseHCITrace(output string) (hciTrace, error) {
-	lines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
-	var trace hciTrace
-	for index := 0; index < len(lines); index++ {
-		header := strings.TrimSpace(lines[index])
-		commandBlock := strings.HasPrefix(header, "< HCI Command:")
-		eventBlock := strings.HasPrefix(header, "> HCI Event: 0xff ")
-		if !commandBlock && !eventBlock {
-			continue
-		}
-		marker := strings.LastIndex(header, "plen ")
-		if marker < 0 {
-			return hciTrace{}, errors.New("HCI trace header omits payload length")
-		}
-		length, err := strconv.Atoi(strings.TrimSpace(header[marker+len("plen "):]))
-		if err != nil || length < 0 || length > 255 {
-			return hciTrace{}, errors.New("HCI trace payload length is invalid")
-		}
-		data := make([]byte, 0, length)
-		for index+1 < len(lines) && len(data) < length {
-			index++
-			line := strings.TrimSpace(lines[index])
-			if line == "" {
-				continue
-			}
-			if strings.HasPrefix(line, "< HCI ") || strings.HasPrefix(line, "> HCI ") {
-				return hciTrace{}, errors.New("HCI trace payload is incomplete")
-			}
-			for _, token := range strings.Fields(line) {
-				if len(token) != 2 {
-					return hciTrace{}, errors.New("HCI trace contains a malformed byte")
-				}
-				value, err := strconv.ParseUint(token, 16, 8)
-				if err != nil {
-					return hciTrace{}, errors.New("HCI trace contains a malformed byte")
-				}
-				data = append(data, byte(value))
-			}
-		}
-		if len(data) != length {
-			return hciTrace{}, errors.New("HCI trace payload length does not match header")
-		}
-		if commandBlock {
-			trace.commands = append(trace.commands, data)
-		} else {
-			trace.vendorEvents = append(trace.vendorEvents, data)
-		}
-	}
-	if len(trace.commands) == 0 {
-		return hciTrace{}, errors.New("hcitool did not report the dispatched HCI command")
-	}
-	return trace, nil
-}
-
-func runCSRCommand(ctx context.Context, hci string, pdu []byte, run csrCommandRunner) (hciTrace, error) {
+func runCSRCommand(ctx context.Context, hci string, pdu []byte,
+	run csrCommandRunner) (csrCommandResult, error) {
 	if run == nil {
-		return hciTrace{}, errors.New("CSR command runner is unavailable")
+		return csrCommandResult{}, errors.New("CSR command runner is unavailable")
 	}
-	args, err := csrCommandArgs(hci, pdu)
-	if err != nil {
-		return hciTrace{}, err
+	if !hciPattern.MatchString(hci) {
+		return csrCommandResult{}, errors.New("invalid HCI controller identity")
 	}
-	output, runErr := run(ctx, "hcitool", args...)
-	trace, parseErr := parseHCITrace(output)
-	if parseErr != nil {
-		return hciTrace{}, errors.Join(runErr, parseErr)
+	result, err := run(ctx, hci, pdu)
+	if !result.Dispatched {
+		return result, errors.Join(err, errors.New("CSR command was not dispatched"))
 	}
-	if len(trace.commands) != 1 || !bytes.Equal(trace.commands[0], pdu) {
-		return hciTrace{}, errors.Join(runErr,
-			errors.New("hcitool command echo does not match the requested CSR PDU"))
-	}
-	return trace, runErr
+	return result, err
 }
 
-func csrResponseWords(trace hciTrace) ([9]uint16, error) {
+func csrResponseWords(result csrCommandResult) ([9]uint16, error) {
 	var words [9]uint16
-	if len(trace.vendorEvents) != 1 {
-		return words, errors.New("CSR response is missing or duplicated")
-	}
-	event := trace.vendorEvents[0]
+	event := result.VendorEvent
 	if len(event) != 19 || event[0] != 0xc2 {
 		return words, errors.New("CSR response has an invalid shape")
 	}
@@ -185,11 +109,11 @@ func readRBRANAFrequency(parent context.Context, hci string, sequence uint16, ru
 	pdu := csrPDU(0, 9, sequence, csrPSVarID, 0, csrANAFrequencyKey, 1, csrPSRAMStore, 0)
 	ctx, cancel := context.WithTimeout(parent, csrCommandTimeout)
 	defer cancel()
-	trace, err := runCSRCommand(ctx, hci, pdu, run)
+	result, err := runCSRCommand(ctx, hci, pdu, run)
 	if err != nil {
 		return 0, 0, fmt.Errorf("read CSR ANA_FREQ: %w", err)
 	}
-	words, err := csrResponseWords(trace)
+	words, err := csrResponseWords(result)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -203,12 +127,12 @@ func setRBRANAFrequency(parent context.Context, hci string, sequence uint16, run
 	setPDU := csrPDU(2, 9, sequence, csrPSVarID, 0,
 		csrANAFrequencyKey, 1, csrPSRAMStore, csrANAFrequency)
 	setContext, finishSet := context.WithTimeout(parent, csrCommandTimeout)
-	setTrace, err := runCSRCommand(setContext, hci, setPDU, run)
+	setResult, err := runCSRCommand(setContext, hci, setPDU, run)
 	finishSet()
 	if err != nil {
 		return fmt.Errorf("set CSR ANA_FREQ: %w", err)
 	}
-	words, err := csrResponseWords(setTrace)
+	words, err := csrResponseWords(setResult)
 	if err != nil {
 		return err
 	}
@@ -230,9 +154,9 @@ func warmRBRController(parent context.Context, hci string, sequence uint16, run 
 	warmPDU := csrPDU(2, 9, sequence, csrWarmResetVarID, 0, 0, 0, 0, 0)
 	ctx, cancel := context.WithTimeout(parent, csrCommandTimeout)
 	defer cancel()
-	trace, err := runCSRCommand(ctx, hci, warmPDU, run)
-	if len(trace.commands) != 1 || !bytes.Equal(trace.commands[0], warmPDU) {
-		return errors.Join(err, errors.New("CSR warm reset dispatch was not proven by an exact command echo"))
+	result, err := runCSRCommand(ctx, hci, warmPDU, run)
+	if !result.Dispatched {
+		return errors.Join(err, errors.New("CSR warm reset was not dispatched"))
 	}
 	if err != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return fmt.Errorf("dispatch CSR warm reset: %w", err)
@@ -247,33 +171,6 @@ func requireHCIExtension(path string) error {
 	}
 	if strings.TrimSpace(string(raw)) != "Y" {
 		return errors.New("HCI vendor extensions are not enabled")
-	}
-	return nil
-}
-
-func checkANAFrequencyMarker(path string) error {
-	_, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	return errors.New("a previous ANA_FREQ transaction did not finish; reboot the router before Start")
-}
-
-func writeANAFrequencyMarker(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	_, writeErr := f.WriteString("ANA_FREQ transaction pending\n")
-	return errors.Join(writeErr, f.Close())
-}
-
-func clearANAFrequencyMarker(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
 	}
 	return nil
 }
